@@ -1,0 +1,13 @@
+variable,type,definition,source,missing_in_analysis,notes
+region,string,Oblast name in English,National Statistical Committee table,No,Seven oblasts
+year,integer,Calendar year,Both sources,No,1991-2025 raw; 1994-2025 model panel
+yield_c_ha,float,"Wheat yield, centners (100 kg) per hectare",Kyrgyz crop-yield table,No,Target
+temp_anomaly_c,float,"National annual 2-m air-temperature anomaly, degrees C relative to 1991-2020",OWID/Copernicus ERA5,No,Country-level context
+lag1,float,Regional yield at t-1,Derived,No,Available before target year
+mean3,float,Mean regional yield over t-1 to t-3,Derived,No,Available before target year
+std3,float,Sample standard deviation of yield over t-1 to t-3,Derived,No,Available before target year
+slope3,float,OLS slope over the three lagged yields,Derived,No,Available before target year
+temp_lag1,float,National temperature anomaly at t-1,Derived,No,Available before target year
+temp_mean3,float,Mean national anomaly over t-1 to t-3,Derived,No,Available before target year
+temp_std3,float,Standard deviation of anomaly over t-1 to t-3,Derived,No,Available before target year
+year_c,integer,Year centered at 2000,Derived,No,Deterministic trend term
