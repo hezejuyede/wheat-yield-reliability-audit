@@ -1,0 +1,13 @@
+{
+  "seed": 26,
+  "development_period": [1994, 2014],
+  "calibration_period": [2015, 2018],
+  "future_test_period": [2019, 2025],
+  "default_spatial_holdout_regions": ["Batken", "Naryn"],
+  "models": ["Persistence", "Ridge", "Random forest", "Gradient boosting", "CAFR"],
+  "target": "regional wheat yield, centners per hectare",
+  "time_freeze": "all predictors for year t end at t-1",
+  "primary_review_capacity_per_year": 1,
+  "review_capacities_audited": [0, 1, 2, 3],
+  "decision_policy": "calibration-frozen CAFR plus fixed-capacity human review"
+}
