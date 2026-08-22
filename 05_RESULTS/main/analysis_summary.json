@@ -1,0 +1,11 @@
+{
+  "study_title": "Reliability Auditing and Capacity-Constrained Review for Wheat-Yield Decision Support under Temporal and Spatial Shift",
+  "split_spec": {"dev_start":1994,"dev_end":2014,"cal_start":2015,"cal_end":2018,"test_start":2019,"test_end":2025},
+  "default_spatial_holdout": ["Batken","Naryn"],
+  "sample_sizes": {"development":105,"calibration":20,"future":35,"spatial":14},
+  "feature_count": 8,
+  "features": ["lag1","mean3","std3","slope3","temp_lag1","temp_mean3","temp_std3","year_c"],
+  "frozen_threshold": 1.2276852378706145,
+  "data_sha256": {"kyrgyz_crop_yield.xls":"b5dbf9d645244c11100b58c5f3f6587f8407ce9baa163071cc32cbe6bae122b9","annual-temperature-anomalies.csv":"b49073e5e3e174a9474999af366a3ec36e8479fae6fc764e2a90a0875e2d5a33"},
+  "key_findings": {"persistence_pooled_mae":4.163265306122448,"cafr_pooled_mae":3.5354271727596194,"cafr_mae_reduction_pct":15.080425752342462,"best_average_model":"Random forest","best_average_mae":3.4324606703805722,"holdout_pairs_cafr_better_than_persistence":21,"holdout_pairs_total":21,"median_holdout_improvement_pct":13.85594711308789,"cafr_random_understatement_pct":30.166909010216976,"primary_review_capacity_per_year":1,"primary_review_coverage":0.8571428571428571,"primary_error_capture_share":0.3304931884622256,"primary_error_capture_lift":2.313452319235579,"cafr_nominal_90_conformal_external_coverage":0.5510204081632653,"cafr_exact_year_signflip_one_sided_p":0.0625,"exact_random_review_p_at_least_observed":3.642797036706037e-06}
+}
