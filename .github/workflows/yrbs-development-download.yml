@@ -7,34 +7,71 @@ permissions: {}
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 8
+    timeout-minutes: 12
     steps:
-      - name: Inspect public development source directories
+      - name: Retrieve official CDC FTP national data and isolate development years
         shell: python
         run: |
-          from concurrent.futures import ThreadPoolExecutor
-          from datetime import datetime,timezone
           from pathlib import Path
-          import urllib.request,json,hashlib,re
+          from datetime import datetime,timezone
+          import urllib.request,json,hashlib,gzip,re,collections
           OUT=Path('yrbs-development-download');OUT.mkdir()
-          sources=[('cdc_2017_directory.html','https://ftp.cdc.gov/pub/Data/YRBS/sadc_2017/'),('cdc_2019_directory.html','https://ftp.cdc.gov/pub/Data/YRBS/SADC_2019/'),('cdc_root.html','https://ftp.cdc.gov/pub/Data/YRBS/'),('archive_2017_file_page.html','https://www.datalumos.org/datalumos/project/217921/version/V2/view?path=%2Fdatalumos%2F217921%2Ffcr%3Aversions%2FV2%2FXXH2017_YRBS_Data.dat&type=file')]
-          def get(item):
-              name,url=item
-              try:
-                  with urllib.request.urlopen(urllib.request.Request(url,headers={'User-Agent':'Mozilla/5.0'}),timeout=45) as r:data=r.read(1000000)
-                  (OUT/name).write_bytes(data)
-                  text=data.decode('utf-8',errors='replace')
-                  return {'file':name,'url':url,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest(),'links':re.findall(r'(?:href|src)=[\"\x27]([^\"\x27]+)',text),'status':'page_downloaded'}
-              except Exception as e:return {'file':name,'url':url,'status':'failed','error':str(e)}
-          with ThreadPoolExecutor(max_workers=4) as p:records=list(p.map(get,sources))
-          receipt={'scope':'Source discovery only; no 2021/2023 data or modelling','complete_microdata_download':False,'files':records}
-          (OUT/'source_discovery.json').write_text(json.dumps(receipt,indent=2))
-          print(json.dumps(receipt,indent=2))
-      - name: Retain public discovery pages and receipt
+          base='https://ftp.cdc.gov/pub/Data/YRBS/SADC_2019/'
+          layout_url=base+'2019-sadc-spss-input-program.sps'
+          data_url=base+'sadc_2019_national.dat'
+          receipt={'complete':False,'source_custodian':'CDC','source_type':'official combined NATIONAL archive ending in 2019, not annual XXH release','confirmation_2023_accessed':False,'empirical_models_run':False,'downloaded_at_utc':datetime.now(timezone.utc).isoformat()}
+          try:
+              with urllib.request.urlopen(layout_url,timeout=90) as r:layout=r.read(200000)
+              (OUT/'SADC2019_combined_layout.sps').write_bytes(layout)
+              syntax=layout.decode('utf-8-sig')
+              m=re.search(r'\byear\s+(\d+)\s*-\s*(\d+)',syntax,re.I)
+              if not m:raise ValueError('Cannot locate year field in official layout')
+              left,right=int(m[1])-1,int(m[2])
+              print('Year byte positions',left+1,right,flush=True)
+              fullhash=hashlib.sha256();fullbytes=0;counts=collections.Counter();selected={2017:0,2019:0};subhash={y:hashlib.sha256() for y in selected}
+              with urllib.request.urlopen(data_url,timeout=180) as src,gzip.open(OUT/'SADC2019_national_source.dat.gz','wb',compresslevel=6) as gz:
+                  head=src.read(500)
+                  if b'<html' in head.lower():raise ValueError('HTML returned instead of national data')
+                  def chunks():
+                      yield head
+                      while True:
+                          c=src.read(1048576)
+                          if not c:break
+                          yield c
+                  handles={y:(OUT/f'{y}_records_from_SADC2019.dat').open('wb') for y in selected}
+                  try:
+                      buffer=b''
+                      for chunk in chunks():
+                          fullbytes+=len(chunk)
+                          if fullbytes>250_000_000:raise ValueError('Unexpected national archive size')
+                          fullhash.update(chunk);gz.write(chunk);buffer+=chunk
+                          lines=buffer.split(b'\n');buffer=lines.pop()
+                          for line in lines:
+                              if not line.strip():continue
+                              year=int(line[left:right]);counts[year]+=1
+                              if year>2019:raise ValueError('Later-cycle data are outside authorized scope')
+                              if year in handles:
+                                  payload=line+b'\n';handles[year].write(payload);subhash[year].update(payload);selected[year]+=1
+                      if buffer.strip():
+                          year=int(buffer[left:right]);counts[year]+=1
+                          if year>2019:raise ValueError('Later-cycle data are outside scope')
+                          if year in handles:handles[year].write(buffer);subhash[year].update(buffer);selected[year]+=1
+                  finally:
+                      for h in handles.values():h.close()
+              receipt.update(data_url=data_url,layout_url=layout_url,source_bytes=fullbytes,source_sha256=fullhash.hexdigest(),layout_sha256=hashlib.sha256(layout).hexdigest(),year_field_1_based=[left+1,right],source_counts_by_year=dict(counts),selected_counts=selected,selected_sha256={y:h.hexdigest() for y,h in subhash.items()})
+              if selected!={2017:14765,2019:13677}:raise ValueError('Development record counts require investigation: '+str(selected))
+              receipt['complete']=True
+          except Exception as e:
+              receipt['error']=type(e).__name__+': '+str(e)
+          (OUT/'source_receipt.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
+          print(json.dumps(receipt,indent=2),flush=True)
+          raise SystemExit(0 if receipt['complete'] else 1)
+      - name: Retain CDC archive, development records and receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: yrbs-development-source-discovery
+          name: yrbs-official-development-files
           path: yrbs-development-download/
           retention-days: 1
+          compression-level: 1
           if-no-files-found: error
