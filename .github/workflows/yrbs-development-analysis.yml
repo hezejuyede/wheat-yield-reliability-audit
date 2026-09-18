@@ -8,14 +8,19 @@ permissions:
 jobs:
   development:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 30
+    env:
+      OMP_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      PYTHONUNBUFFERED: "1"
     steps:
-      - name: Verify official source artifact and inspect its own combined layout
+      - name: Verify previously acquired official 2017 and 2019 records
         shell: python
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          import os,json,hashlib,urllib.request,urllib.error,zipfile,io,re
+          import os,json,hashlib,urllib.request,urllib.error,zipfile,io
           from pathlib import Path
           API='https://api.github.com/repos/hezejuyede/wheat-yield-reliability-audit/actions/artifacts/10527521162/zip'
           EXPECTED='7c1f562dc92160a76bbf0bade0e8b114bb72cf79fa7478721bbfdadb3deceec9'
@@ -27,37 +32,46 @@ jobs:
               payload=response.read()
           except urllib.error.HTTPError as e:
               if e.code not in (301,302,303,307,308): raise
-              location=e.headers['Location']
-              # Do not forward the GitHub token to the signed storage URL.
-              with urllib.request.urlopen(location,timeout=90) as r: payload=r.read()
+              with urllib.request.urlopen(e.headers['Location'],timeout=90) as r: payload=r.read()
           assert hashlib.sha256(payload).hexdigest()==EXPECTED,'Artifact SHA-256 mismatch'
           out=Path('development_evidence');out.mkdir()
           required={'2017_records_from_SADC2019.dat','2019_records_from_SADC2019.dat','SADC2019_combined_layout.sps','source_receipt.json'}
           with zipfile.ZipFile(io.BytesIO(payload)) as z:
-              assert z.testzip() is None,'Artifact CRC failure'
-              assert set(z.namelist())==required,'Unexpected artifact members'
+              assert z.testzip() is None and set(z.namelist())==required
               for name in sorted(required):(out/name).write_bytes(z.read(name))
           receipt=json.loads((out/'source_receipt.json').read_text())
           assert receipt['complete'] and not receipt['confirmation_2023_accessed']
           for year,n in [(2017,14765),(2019,13677)]:
               data=(out/f'{year}_records_from_SADC2019.dat').read_bytes()
               assert hashlib.sha256(data).hexdigest()==receipt['selected_sha256'][str(year)]
-              rows=[r for r in data.splitlines() if r.strip()]
-              assert len(rows)==n
+              rows=data.splitlines();assert len(rows)==n
               assert all(int(r[113:121])==year for r in rows)
               print('VERIFIED_SOURCE',year,n,len(data),hashlib.sha256(data).hexdigest())
-          layout=(out/'SADC2019_combined_layout.sps').read_text(encoding='utf-8-sig')
-          print('BEGIN_OFFICIAL_COMBINED_LAYOUT')
-          print(layout)
-          print('END_OFFICIAL_COMBINED_LAYOUT')
-          status={'phase':'source_and_layout_audit','official_artifact_verified':True,'years':[2017,2019],'empirical_models_run':False,'confirmation_2023_accessed':False,'source_archive_sha256':EXPECTED}
-          (out/'AUDIT_STATUS.json').write_text(json.dumps(status,indent=2))
-          print('AUDIT_STATUS',json.dumps(status))
-      - name: Retain source verification evidence
+          url='https://raw.githubusercontent.com/hezejuyede/wheat-yield-reliability-audit/f1cb098c7ca279b87a12da8ef5aa15c1ca762417/research/yrbs_development_pilot.py'
+          with urllib.request.urlopen(url,timeout=60) as r: code=r.read()
+          assert hashlib.sha256(code).hexdigest()=='4d004d6ddc013564bd26521f4c291b814034a193ea064b8e07c9706681739be7','Analysis code mismatch'
+          compile(code,'development_pilot.py','exec')
+          Path('development_pilot.py').write_bytes(code)
+      - name: Install fixed numerical environment
+        shell: bash
+        run: |
+          python3 -m venv .venv
+          .venv/bin/python -m pip install --disable-pip-version-check numpy==2.2.6 pandas==2.2.3 scipy==1.15.3 scikit-learn==1.6.1 statsmodels==0.14.4
+          .venv/bin/python -m pip freeze > development_evidence/environment.lock.txt
+      - name: Run real developmental models without later-cycle access
+        shell: bash
+        run: |
+          .venv/bin/python development_pilot.py --source development_evidence --out pilot_results --bootstrap 399
+          cp development_pilot.py pilot_results/development_pilot.py
+      - name: Retain real development audit and results
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: yrbs-development-source-audit
-          path: development_evidence/
+          name: yrbs-real-development-pilot-v11
+          path: |
+            development_evidence/
+            pilot_results/
+            development_pilot.py
           retention-days: 1
+          compression-level: 6
           if-no-files-found: error
