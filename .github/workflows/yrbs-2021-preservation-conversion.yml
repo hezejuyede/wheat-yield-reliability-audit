@@ -1,0 +1,34 @@
+name: Convert preserved YRBS 2021 for source audit
+on:
+  push:
+    branches: [research/yrbs-development-download]
+    paths: [.github/workflows/yrbs-2021-preservation-conversion.yml]
+permissions:
+  contents: read
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install pinned table reader
+        run: python -m pip install 'pandas==2.2.3' 'pyarrow==19.0.1'
+      - name: Convert only 2021 rows and preserve schema and hash
+        shell: python
+        run: |
+          import pandas as pd,urllib.request,hashlib,json,io
+          from pathlib import Path
+          url='https://raw.githubusercontent.com/dahdor/wired-apart/dd732ac63f230e05e0d44e24ed3503d2b92d5cc1/data/processed/yrbs_2005_2021.parquet'
+          with urllib.request.urlopen(url,timeout=60) as r:b=r.read(20*1024*1024)
+          assert hashlib.sha256(b).hexdigest()=='7f192686c944624a367ccd14ce197169f7c1ed219d74f16de9cd75004e1e3074'
+          d=pd.read_parquet(io.BytesIO(b));assert int(d.year.max())==2021
+          x=d.loc[d.year.eq(2021)].copy();assert len(x)==17232
+          o=Path('yrbs2021-converted');o.mkdir()
+          x.to_csv(o/'independent_2021.csv.gz',index=False,compression={'method':'gzip','mtime':0})
+          z={'source_url':url,'source_sha256':hashlib.sha256(b).hexdigest(),'all_source_year_counts':{str(k):int(v) for k,v in d.year.value_counts().items()},'selected_rows':len(x),'columns':list(x.columns),'dtypes':x.dtypes.astype(str).to_dict(),'output_sha256':hashlib.sha256((o/'independent_2021.csv.gz').read_bytes()).hexdigest(),'preserved_converted_data_not_custodian_certified':True,'confirmation_2023_accessed':False}
+          (o/'conversion_receipt.json').write_text(json.dumps(z,indent=2));print(json.dumps(z,indent=2))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: yrbs2021-preserved-conversion
+          path: yrbs2021-converted/
+          retention-days: 7
+          if-no-files-found: error
