@@ -15,7 +15,7 @@ jobs:
       MKL_NUM_THREADS: "1"
       PYTHONUNBUFFERED: "1"
     steps:
-      - name: Verify previously acquired official 2017 and 2019 records
+      - name: Verify official development data and pre-fit parser correction
         shell: python
         env:
           GH_TOKEN: ${{ github.token }}
@@ -49,9 +49,17 @@ jobs:
               print('VERIFIED_SOURCE',year,n,len(data),hashlib.sha256(data).hexdigest())
           url='https://raw.githubusercontent.com/hezejuyede/wheat-yield-reliability-audit/f1cb098c7ca279b87a12da8ef5aa15c1ca762417/research/yrbs_development_pilot.py'
           with urllib.request.urlopen(url,timeout=60) as r: code=r.read()
-          assert hashlib.sha256(code).hexdigest()=='4d004d6ddc013564bd26521f4c291b814034a193ea064b8e07c9706681739be7','Analysis code mismatch'
+          assert hashlib.sha256(code).hexdigest()=='4d004d6ddc013564bd26521f4c291b814034a193ea064b8e07c9706681739be7'
+          text=code.decode()
+          old="        raw=raw.replace('',np.nan).apply(pd.to_numeric,errors='raise')"
+          new="        missing_tokens={v:{'blank':int(raw[v].eq('').sum()),'dot':int(raw[v].eq('.').sum())} for v in raw}\n        write_json(out/f'{year}_source_missing_tokens.json',missing_tokens)\n        print('MISSING_TOKEN_AUDIT',year,json.dumps(missing_tokens),flush=True)\n        # A single period in a numeric fixed-width field is system missing.\n        # Convert only blank and exact period; unexpected text still raises.\n        raw=raw.replace({'':np.nan,'.':np.nan}).apply(pd.to_numeric,errors='raise')"
+          assert text.count(old)==1
+          text=text.replace(old,new)
+          code=text.encode()
+          assert hashlib.sha256(code).hexdigest()=='d13d801f2b4bd62e84de94b429dd09291223860a96c80015ab7481a7bfcde42a'
           compile(code,'development_pilot.py','exec')
           Path('development_pilot.py').write_bytes(code)
+          (out/'PRE_FIT_CORRECTION.txt').write_text('First attempt stopped before fitting on a single-period numeric system-missing token. Exact blank/dot tokens are now logged and converted to missing; all other unexpected text raises. No model results were available for this technical correction.')
       - name: Install fixed numerical environment
         shell: bash
         run: |
