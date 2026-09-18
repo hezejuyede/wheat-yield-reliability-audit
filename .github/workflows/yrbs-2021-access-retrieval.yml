@@ -1,0 +1,39 @@
+name: Official 2021 YRBS Access archive
+on:
+  push:
+    branches: [research/yrbs-development-download]
+    paths: [.github/workflows/yrbs-2021-access-retrieval.yml]
+permissions:
+  contents: read
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Fetch official 2021 Access archive only
+        shell: python
+        run: |
+          from pathlib import Path
+          from concurrent.futures import ThreadPoolExecutor
+          import urllib.request,hashlib,json,zipfile,io
+          o=Path('yrbs2021-official-access');o.mkdir()
+          urls=['https://www.cdc.gov/yrbs/files/2021/XXH2021_YRBS_Data.zip','https://www.cdc.gov/healthyyouth/data/yrbs/files/2021/XXH2021_YRBS_Data.zip','https://www.cdc.gov/yrbs/files/2021/pdf/2021_YRBS_Data_Users_Guide_508.pdf']
+          def get(pair):
+            i,u=pair;x={'url':u,'complete':False}
+            try:
+              with urllib.request.urlopen(urllib.request.Request(u,headers={'User-Agent':'Mozilla/5.0'}),timeout=90) as r:d=r.read(64*1024*1024+1);x['final_url']=r.url
+              if len(d)>64*1024*1024:raise ValueError('size limit')
+              if u.endswith('.zip'):
+                z=zipfile.ZipFile(io.BytesIO(d));assert z.testzip() is None;x['members']=z.namelist()
+              else:assert d.startswith(b'%PDF')
+              name=f'official2021_{i}'+('.zip' if u.endswith('.zip') else '.pdf');(o/name).write_bytes(d);x.update(complete=True,name=name,bytes=len(d),sha256=hashlib.sha256(d).hexdigest())
+            except Exception as e:x['error']=type(e).__name__+': '+str(e)
+            return x
+          with ThreadPoolExecutor(max_workers=3) as pool:rows=list(pool.map(get,enumerate(urls)))
+          report={'confirmation_2023_accessed':False,'sources':rows};(o/'receipt.json').write_text(json.dumps(report,indent=2));print(json.dumps(report,indent=2))
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: yrbs2021-official-access
+          path: yrbs2021-official-access/
+          retention-days: 7
+          if-no-files-found: error
