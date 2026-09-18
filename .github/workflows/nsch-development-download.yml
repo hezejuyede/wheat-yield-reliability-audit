@@ -1,0 +1,66 @@
+name: NSCH official development-source retrieval
+on:
+  push:
+    branches: ["research/yrbs-development-download"]
+    paths: [".github/workflows/nsch-development-download.yml"]
+permissions: {}
+jobs:
+  download:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Download only official 2021 and 2022 topical data and documentation
+        shell: python
+        run: |
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from concurrent.futures import ThreadPoolExecutor
+          import urllib.request, hashlib, json, zipfile, io, time
+          out = Path('nsch-development-sources'); out.mkdir()
+          base = 'https://www2.census.gov/programs-surveys/nsch/'
+          items = []
+          for year in (2021, 2022):
+              items.extend([
+                  (f'nsch_{year}_topical_Stata.zip', base+f'datasets/{year}/nsch_{year}_topical_Stata.zip', 'zip'),
+                  (f'{year}-NSCH-Topical-Variable-List.pdf', base+f'technical-documentation/codebook/{year}-NSCH-Topical-Variable-List.pdf', 'pdf'),
+                  (f'NSCH_{year}_Topical_Frequencies.pdf', base+f'technical-documentation/codebook/NSCH_{year}_Topical_Frequencies.pdf', 'pdf')])
+          items.append(('NSCH-Analytic-Guide.pdf', base+'technical-documentation/methodology/NSCH-Analytic-Guide.pdf', 'pdf'))
+          def retrieve(item):
+              name, url, kind = item
+              row = {'file':name, 'url':url, 'success':False}
+              for attempt in range(1, 4):
+                  try:
+                      req = urllib.request.Request(url, headers={'User-Agent':'Public-data-reproducibility/1.0'})
+                      with urllib.request.urlopen(req, timeout=150) as response:
+                          payload = response.read(32*1024*1024+1)
+                          row['final_url'] = response.url
+                          row['last_modified'] = response.headers.get('Last-Modified')
+                      if len(payload)>32*1024*1024: raise ValueError('File exceeds fixed 32-MiB ceiling')
+                      if kind=='zip':
+                          with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+                              if archive.testzip() is not None: raise ValueError('CRC failure')
+                              row['members'] = archive.namelist()
+                              if not any(x.lower().endswith('.dta') for x in row['members']): raise ValueError('No Stata member')
+                      elif not payload.startswith(b'%PDF'): raise ValueError('Not a PDF')
+                      (out/name).write_bytes(payload)
+                      row.update(success=True, bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest(), retrieved_utc=datetime.now(timezone.utc).isoformat(), attempt=attempt)
+                      print(json.dumps(row), flush=True)
+                      return row
+                  except Exception as exc:
+                      row['error']=type(exc).__name__+': '+str(exc)
+                      time.sleep(attempt)
+              print(json.dumps(row), flush=True)
+              return row
+          with ThreadPoolExecutor(max_workers=3) as pool: receipts=list(pool.map(retrieve,items))
+          summary={'records':receipts, 'complete':all(x['success'] for x in receipts), 'years':[2021,2022], 'confirmation_2023_accessed':False, 'models_fitted':False}
+          (out/'source_receipt.json').write_text(json.dumps(summary,indent=2),encoding='utf-8')
+          if not summary['complete']: raise SystemExit('One or more official sources failed; retain receipt')
+      - name: Retain public-source files and checksums
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: nsch-official-2021-2022-development-sources
+          path: nsch-development-sources/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
