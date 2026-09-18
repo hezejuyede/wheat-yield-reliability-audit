@@ -7,66 +7,66 @@ permissions: {}
 jobs:
   download:
     runs-on: ubuntu-latest
-    timeout-minutes: 12
+    timeout-minutes: 10
     steps:
-      - name: Retrieve smaller CDC national ZIP and isolate development records
+      - name: Retrieve final 32 MiB of official pre-2020 national archive
         shell: python
         run: |
           from pathlib import Path
           from datetime import datetime,timezone
           from concurrent.futures import ThreadPoolExecutor
-          import urllib.request,json,hashlib,zipfile,re,collections,time
+          import urllib.request,json,hashlib,re,collections,time
           OUT=Path('yrbs-development-download');OUT.mkdir()
           BASE='https://ftp.cdc.gov/pub/Data/YRBS/SADC_2019/'
-          SOURCES=[('SADC_2019_National.zip',BASE+'SADC_2019_National.zip'),('SADC2019_combined_layout.sps',BASE+'2019-sadc-spss-input-program.sps')]
-          receipt={'complete':False,'confirmation_2023_accessed':False,'empirical_models_run':False,'scope':'Official CDC combined NATIONAL archive ending in 2019; extract only 2017 and 2019. Not annual XXH release.','downloaded_at_utc':datetime.now(timezone.utc).isoformat()}
-          def download(item):
-              name,url=item;path=OUT/name;h=hashlib.sha256();n=0;t=time.time()
-              with urllib.request.urlopen(url,timeout=180) as r,path.open('wb') as f:
-                  while True:
-                      chunk=r.read(262144)
-                      if not chunk:break
-                      n+=len(chunk)
-                      if n>100000000:raise ValueError('Unexpected file size')
-                      h.update(chunk);f.write(chunk)
-                      if n%(5*1048576)<262144:print(name,n,'bytes',round(time.time()-t,1),'seconds',flush=True)
-              return {'file':name,'url':url,'bytes':n,'sha256':h.hexdigest()}
+          DATA=BASE+'sadc_2019_national.dat';LAYOUT=BASE+'2019-sadc-spss-input-program.sps'
+          receipt={'complete':False,'confirmation_2023_accessed':False,'empirical_models_run':False,'source_type':'official CDC NATIONAL combined archive ending 2019, HTTP byte-range extraction, not annual XXH file','started_utc':datetime.now(timezone.utc).isoformat()}
           try:
-              with ThreadPoolExecutor(max_workers=2) as p:receipt['downloads']=list(p.map(download,SOURCES))
-              syntax=(OUT/'SADC2019_combined_layout.sps').read_text(encoding='utf-8-sig')
-              m=re.search(r'\byear\s+(\d+)\s*-\s*(\d+)',syntax,re.I)
-              if not m:raise ValueError('Year field absent from official SPSS layout')
-              left,right=int(m[1])-1,int(m[2]);counts=collections.Counter();selected={2017:0,2019:0}
-              sh={y:hashlib.sha256() for y in selected};source_h=hashlib.sha256();source_bytes=0
-              with zipfile.ZipFile(OUT/'SADC_2019_National.zip') as z:
-                  receipt['archive_members']=[{'name':x.filename,'bytes':x.file_size} for x in z.infolist()]
-                  names=[n for n in z.namelist() if n.lower().endswith('.dat') and 'national' in n.lower()]
-                  if len(names)!=1:raise ValueError('No unique national DAT member; inspect archive_members')
-                  member=names[0];receipt['selected_source_member']=member
-                  handles={y:(OUT/f'{y}_records_from_SADC2019.dat').open('wb') for y in selected}
-                  try:
-                      with z.open(member) as src:
-                          for line in src:
-                              source_h.update(line);source_bytes+=len(line)
-                              if not line.strip():continue
-                              year=int(line[left:right]);counts[year]+=1
-                              if year>2019:raise ValueError('Data after 2019 are outside scope')
-                              if year in handles:handles[year].write(line);sh[year].update(line);selected[year]+=1
-                  finally:
-                      for h in handles.values():h.close()
-              receipt.update(source_uncompressed_sha256=source_h.hexdigest(),source_uncompressed_bytes=source_bytes,source_counts_by_year=dict(counts),selected_counts=selected,selected_sha256={y:h.hexdigest() for y,h in sh.items()},year_field_1_based=[left+1,right])
-              if selected!={2017:14765,2019:13677}:raise ValueError('Development counts require investigation: '+str(selected))
+              with urllib.request.urlopen(LAYOUT,timeout=60) as r:layout=r.read(200000)
+              (OUT/'SADC2019_combined_layout.sps').write_bytes(layout)
+              m=re.search(r'\byear\s+(\d+)\s*-\s*(\d+)',layout.decode('utf-8-sig'),re.I)
+              if not m:raise ValueError('Year field absent')
+              left,right=int(m[1])-1,int(m[2])
+              request=urllib.request.Request(DATA,headers={'Range':'bytes=0-1023'})
+              with urllib.request.urlopen(request,timeout=60) as r:
+                  if r.status!=206:raise ValueError('Server does not honor Range; stop without full transfer')
+                  cr=r.headers.get('Content-Range','');first=r.read(1025)
+              total=int(cr.split('/')[-1]);start=max(0,total-32*1048576);chunk=1048576
+              receipt.update(data_url=DATA,layout_url=LAYOUT,source_total_bytes=total,requested_byte_range=[start,total-1],layout_sha256=hashlib.sha256(layout).hexdigest())
+              tasks=[(i,a,min(a+chunk,total)-1) for i,a in enumerate(range(start,total,chunk))]
+              def get(t):
+                  i,a,b=t;req=urllib.request.Request(DATA,headers={'Range':f'bytes={a}-{b}'})
+                  with urllib.request.urlopen(req,timeout=120) as r:
+                      cr=r.headers.get('Content-Range','')
+                      if r.status!=206 or cr!=f'bytes {a}-{b}/{total}':raise ValueError('Unexpected Content-Range '+cr)
+                      data=r.read(b-a+2)
+                  if len(data)!=b-a+1:raise ValueError('Range length mismatch')
+                  print('Range',i,'verified',len(data),'bytes',flush=True)
+                  return data
+              with ThreadPoolExecutor(max_workers=4) as p:chunks=list(p.map(get,tasks))
+              payload=b''.join(chunks);receipt['range_sha256']=hashlib.sha256(payload).hexdigest()
+              # Skip the first partial line; included years must still meet full documented counts.
+              lines=payload.splitlines(keepends=True)
+              if start:lines=lines[1:]
+              counts=collections.Counter();selected={2017:[],2019:[]}
+              for line in lines:
+                  if not line.strip():continue
+                  year=int(line[left:right]);counts[year]+=1
+                  if year>2019:raise ValueError('Later-cycle record outside scope')
+                  if year in selected:selected[year].append(line)
+              for year,rows in selected.items():(OUT/f'{year}_records_from_SADC2019.dat').write_bytes(b''.join(rows))
+              receipt.update(observed_range_year_counts=dict(counts),selected_counts={y:len(rows) for y,rows in selected.items()},selected_sha256={y:hashlib.sha256(b''.join(rows)).hexdigest() for y,rows in selected.items()},year_field_1_based=[left+1,right],full_source_sha256_not_obtained=True)
+              if receipt['selected_counts']!={2017:14765,2019:13677}:raise ValueError('Range did not recover complete development years')
               receipt['complete']=True
           except Exception as e:receipt['error']=type(e).__name__+': '+str(e)
           (OUT/'source_receipt.json').write_text(json.dumps(receipt,indent=2),encoding='utf-8')
           print(json.dumps(receipt,indent=2),flush=True)
           raise SystemExit(0 if receipt['complete'] else 1)
-      - name: Retain official public archive and verified development records
+      - name: Retain only official development records and receipt
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: yrbs-official-development-files
+          name: yrbs-official-development-range-files
           path: yrbs-development-download/
           retention-days: 1
-          compression-level: 1
+          compression-level: 6
           if-no-files-found: error
