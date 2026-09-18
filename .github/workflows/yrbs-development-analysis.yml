@@ -1,0 +1,63 @@
+name: YRBS development-only audit and analysis
+on:
+  push:
+    branches: ["research/yrbs-development-download"]
+    paths: [".github/workflows/yrbs-development-analysis.yml"]
+permissions:
+  actions: read
+jobs:
+  development:
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Verify official source artifact and inspect its own combined layout
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import os,json,hashlib,urllib.request,urllib.error,zipfile,io,re
+          from pathlib import Path
+          API='https://api.github.com/repos/hezejuyede/wheat-yield-reliability-audit/actions/artifacts/10527521162/zip'
+          EXPECTED='7c1f562dc92160a76bbf0bade0e8b114bb72cf79fa7478721bbfdadb3deceec9'
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self,*args,**kwargs): return None
+          request=urllib.request.Request(API,headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'],'Accept':'application/vnd.github+json','X-GitHub-Api-Version':'2022-11-28'})
+          try:
+              response=urllib.request.build_opener(NoRedirect).open(request,timeout=60)
+              payload=response.read()
+          except urllib.error.HTTPError as e:
+              if e.code not in (301,302,303,307,308): raise
+              location=e.headers['Location']
+              # Do not forward the GitHub token to the signed storage URL.
+              with urllib.request.urlopen(location,timeout=90) as r: payload=r.read()
+          assert hashlib.sha256(payload).hexdigest()==EXPECTED,'Artifact SHA-256 mismatch'
+          out=Path('development_evidence');out.mkdir()
+          required={'2017_records_from_SADC2019.dat','2019_records_from_SADC2019.dat','SADC2019_combined_layout.sps','source_receipt.json'}
+          with zipfile.ZipFile(io.BytesIO(payload)) as z:
+              assert z.testzip() is None,'Artifact CRC failure'
+              assert set(z.namelist())==required,'Unexpected artifact members'
+              for name in sorted(required):(out/name).write_bytes(z.read(name))
+          receipt=json.loads((out/'source_receipt.json').read_text())
+          assert receipt['complete'] and not receipt['confirmation_2023_accessed']
+          for year,n in [(2017,14765),(2019,13677)]:
+              data=(out/f'{year}_records_from_SADC2019.dat').read_bytes()
+              assert hashlib.sha256(data).hexdigest()==receipt['selected_sha256'][str(year)]
+              rows=[r for r in data.splitlines() if r.strip()]
+              assert len(rows)==n
+              assert all(int(r[113:121])==year for r in rows)
+              print('VERIFIED_SOURCE',year,n,len(data),hashlib.sha256(data).hexdigest())
+          layout=(out/'SADC2019_combined_layout.sps').read_text(encoding='utf-8-sig')
+          print('BEGIN_OFFICIAL_COMBINED_LAYOUT')
+          print(layout)
+          print('END_OFFICIAL_COMBINED_LAYOUT')
+          status={'phase':'source_and_layout_audit','official_artifact_verified':True,'years':[2017,2019],'empirical_models_run':False,'confirmation_2023_accessed':False,'source_archive_sha256':EXPECTED}
+          (out/'AUDIT_STATUS.json').write_text(json.dumps(status,indent=2))
+          print('AUDIT_STATUS',json.dumps(status))
+      - name: Retain source verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: yrbs-development-source-audit
+          path: development_evidence/
+          retention-days: 1
+          if-no-files-found: error
