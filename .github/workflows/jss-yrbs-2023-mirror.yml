@@ -1,0 +1,105 @@
+name: JSS 2023 YRBS checksum-verified public mirror
+on:
+  push:
+    branches: ["research/jss-2023-validation"]
+    paths: [".github/workflows/jss-yrbs-2023-mirror.yml"]
+permissions: {}
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Retrieve byte-preserving public mirror and verify published checksum
+        shell: python
+        run: |
+          from pathlib import Path
+          from datetime import datetime,timezone
+          import urllib.request,hashlib,json,zipfile,io
+          OUT=Path("jss-yrbs-2023-mirror"); OUT.mkdir()
+          mirror="https://stillhere.ai-ministries.com/data/yrbs/XXH2023_YRBS_Data.zip"
+          manifest="https://stillhere.ai-ministries.com/data/yrbs/manifest.json"
+          expected="5343eeecf9aee1e50e68510fb05d7142236f67f7a54879a611f04ece39e79936"
+          official="https://www.cdc.gov/yrbs/files/2023/XXH2023_YRBS_Data.zip"
+          receipt={"retrieved_utc":datetime.now(timezone.utc).isoformat(),
+                   "retrieval_source":"independent byte-preserving public mirror",
+                   "official_source_url":official,
+                   "mirror_url":mirror,
+                   "mirror_manifest_url":manifest,
+                   "expected_sha256":expected,
+                   "note":"Mirror used only because CDC returned 403 to automated environments; content is accepted only if the mirror manifest maps the same filename to the same official CDC URL and the downloaded bytes match the manifest SHA-256 exactly.",
+                   "complete":False}
+          try:
+              req=urllib.request.Request(manifest,headers={"User-Agent":"Mozilla/5.0 reproducibility-audit"})
+              with urllib.request.urlopen(req,timeout=60) as r: m=json.loads(r.read().decode())
+              ent=m["files"]["XXH2023_YRBS_Data.zip"]
+              if ent["url"]!=official or ent["sha256"]!=expected or ent["bytes"]!=3306896:
+                  raise ValueError("mirror manifest does not match frozen source identity")
+              req=urllib.request.Request(mirror,headers={"User-Agent":"Mozilla/5.0 reproducibility-audit"})
+              with urllib.request.urlopen(req,timeout=120) as r: data=r.read(10_000_001)
+              got=hashlib.sha256(data).hexdigest()
+              if len(data)!=3306896 or got!=expected: raise ValueError(f"mirror byte/hash mismatch {len(data)} {got}")
+              z=zipfile.ZipFile(io.BytesIO(data)); names=z.namelist()
+              mdbs=[n for n in names if n.lower().endswith(".mdb")]
+              if len(mdbs)!=1: raise ValueError(f"expected one MDB, got {mdbs}")
+              mdb=z.read(mdbs[0])
+              (OUT/"XXH2023_YRBS_Data.zip").write_bytes(data)
+              (OUT/"XXH2023_YRBS_Data.mdb").write_bytes(mdb)
+              receipt.update(zip_bytes=len(data),zip_sha256=got,zip_members=names,
+                             mdb_bytes=len(mdb),mdb_sha256=hashlib.sha256(mdb).hexdigest(),
+                             manifest_entry=ent,complete=True)
+          except Exception as e:
+              receipt["error"]=f"{type(e).__name__}: {e}"
+          (OUT/"source_receipt.json").write_text(json.dumps(receipt,indent=2),encoding="utf-8")
+          print(json.dumps(receipt,indent=2),flush=True)
+          raise SystemExit(0 if receipt["complete"] else 1)
+      - name: Export Access tables
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mdbtools
+          MDB=jss-yrbs-2023-mirror/XXH2023_YRBS_Data.mdb
+          mdb-tables -1 "$MDB" | sed '/^[[:space:]]*$/d' | tee jss-yrbs-2023-mirror/mdb_tables.txt
+          idx=0
+          while IFS= read -r table; do
+            [[ -z "$table" ]] && continue
+            idx=$((idx+1))
+            safe=$(printf '%s' "$table" | tr -cs 'A-Za-z0-9._-' '_')
+            out="jss-yrbs-2023-mirror/table_$idx-$safe.csv"
+            mdb-export "$MDB" "$table" > "$out"
+            rows=$(( $(wc -l < "$out") - 1 ))
+            printf '%s\t%s\t%s\n' "$table" "$rows" "$out" | tee -a jss-yrbs-2023-mirror/mdb_export_log.txt
+          done < jss-yrbs-2023-mirror/mdb_tables.txt
+      - name: Identify national student table and finalize receipt
+        if: success()
+        shell: python
+        run: |
+          from pathlib import Path
+          import csv,json,hashlib
+          OUT=Path("jss-yrbs-2023-mirror")
+          r=json.loads((OUT/"source_receipt.json").read_text())
+          exports=[]
+          for p in sorted(OUT.glob("table_*.csv")):
+              with p.open("r",encoding="utf-8-sig",newline="") as f:
+                  rd=csv.reader(f); header=next(rd); rows=sum(1 for _ in rd)
+              exports.append({"file":p.name,"rows":rows,"columns":len(header),"header":header,
+                              "bytes":p.stat().st_size,"sha256":hashlib.sha256(p.read_bytes()).hexdigest()})
+          r["exports"]=exports
+          candidates=[x for x in exports if 15000 <= x["rows"] <= 25000 and x["columns"]>=50]
+          if len(candidates)!=1:
+              r["complete"]=False; r["error"]=f"expected one national student table, found {len(candidates)}"
+          else:
+              r["selected_export"]=candidates[0]["file"]; r["complete"]=True
+          (OUT/"source_receipt.json").write_text(json.dumps(r,indent=2),encoding="utf-8")
+          print(json.dumps(r,indent=2))
+          raise SystemExit(0 if r["complete"] else 1)
+      - name: Retain source and export
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jss-yrbs-2023-mirror
+          path: jss-yrbs-2023-mirror/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
