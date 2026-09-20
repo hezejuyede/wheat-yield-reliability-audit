@@ -9,81 +9,99 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Retrieve official CDC 2023 national YRBS data and SPSS layout
+      - name: Retrieve official CDC 2023 national YRBS Access archive and syntax
         shell: python
         run: |
           from pathlib import Path
           from datetime import datetime, timezone
-          import urllib.request, urllib.error, hashlib, json, zipfile, io, time
-          OUT = Path("jss-yrbs-2023-official"); OUT.mkdir()
+          import urllib.request, hashlib, json, zipfile, io
+          OUT=Path("jss-yrbs-2023-official"); OUT.mkdir()
           INDEX="https://www.cdc.gov/yrbs/data/index.html"
-          CANDIDATES=[
-            ("XXH2023_YRBS_Data.zip","https://www.cdc.gov/yrbs/files/2023/XXH2023_YRBS_Data.zip"),
-            ("XXH2023_YRBS_Data.dat","https://www.cdc.gov/yrbs/files/2023/XXH2023_YRBS_Data.dat"),
-          ]
+          DATA="https://www.cdc.gov/yrbs/files/2023/XXH2023_YRBS_Data.zip"
           SPSS="https://www.cdc.gov/yrbs/media/files/2026/03/2023XXH-SPSS.sps"
           receipt={"retrieved_utc":datetime.now(timezone.utc).isoformat(),"source_authority":"U.S. CDC",
                    "scope":"2023 national YRBS only","purpose":"locked later-cycle validation for JSS research article",
-                   "attempts":[],"files":[],"complete":False}
-          opener=urllib.request.build_opener()
-          opener.addheaders=[("User-Agent","Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36"),
-                             ("Accept","text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
-                             ("Accept-Language","en-US,en;q=0.9")]
+                   "files":[],"complete":False}
+          headers={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
+                   "Accept":"*/*","Referer":INDEX}
+          def get(url,limit):
+              req=urllib.request.Request(url,headers=headers)
+              with urllib.request.urlopen(req,timeout=120) as r:
+                  data=r.read(limit+1); final=r.geturl(); ctype=r.headers.get("Content-Type","")
+              if not (1000 <= len(data) <= limit): raise ValueError(f"unexpected payload size {len(data)} for {url}")
+              if b"<html" in data[:1000].lower(): raise ValueError("HTML instead of requested file")
+              return data,final,ctype
           try:
-            try:
-              with opener.open(INDEX,timeout=60) as r:
-                page=r.read(400000)
-              receipt["index_status"]="retrieved"
-              receipt["index_sha256"]=hashlib.sha256(page).hexdigest()
-            except Exception as e:
-              receipt["index_status"]=f"{type(e).__name__}: {e}"
-            payload=None; source_name=None; source_url=None
-            for name,url in CANDIDATES:
+              zdata,final,ctype=get(DATA,10_000_000)
+              (OUT/"XXH2023_YRBS_Data.zip").write_bytes(zdata)
+              receipt["files"].append({"file":"XXH2023_YRBS_Data.zip","url":DATA,"final_url":final,"content_type":ctype,
+                                       "bytes":len(zdata),"sha256":hashlib.sha256(zdata).hexdigest()})
+              z=zipfile.ZipFile(io.BytesIO(zdata)); names=z.namelist(); receipt["zip_members"]=names
+              mdbs=[n for n in names if n.lower().endswith(".mdb")]
+              if len(mdbs)!=1: raise ValueError(f"expected one MDB member, got {mdbs}")
+              mdb=z.read(mdbs[0]); (OUT/"XXH2023_YRBS_Data.mdb").write_bytes(mdb)
+              receipt["files"].append({"file":"XXH2023_YRBS_Data.mdb","archive_member":mdbs[0],
+                                       "bytes":len(mdb),"sha256":hashlib.sha256(mdb).hexdigest()})
               try:
-                req=urllib.request.Request(url,headers={
-                  "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
-                  "Accept":"*/*","Referer":INDEX,"Sec-Fetch-Site":"same-origin","Sec-Fetch-Mode":"navigate"})
-                with opener.open(req,timeout=120) as r:
-                  data=r.read(30_000_001); final_url=r.geturl(); ctype=r.headers.get("Content-Type","")
-                receipt["attempts"].append({"url":url,"status":"downloaded","bytes":len(data),"content_type":ctype,"final_url":final_url})
-                if len(data)<1000 or len(data)>30_000_000: raise ValueError("unexpected payload size")
-                if b"<html" in data[:1000].lower(): raise ValueError("HTML instead of data")
-                payload=data; source_name=name; source_url=url; break
+                  sps,final,ctype=get(SPSS,500_000)
+                  text=sps.decode("utf-8-sig",errors="replace").upper()
+                  if "DATA LIST" not in text or "VALUE LABELS" not in text: raise ValueError("unexpected SPSS syntax")
+                  (OUT/"2023XXH-SPSS.sps").write_bytes(sps)
+                  receipt["files"].append({"file":"2023XXH-SPSS.sps","url":SPSS,"final_url":final,"content_type":ctype,
+                                           "bytes":len(sps),"sha256":hashlib.sha256(sps).hexdigest()})
               except Exception as e:
-                receipt["attempts"].append({"url":url,"status":"failed","error":f"{type(e).__name__}: {e}"})
-                time.sleep(1)
-            if payload is None: raise RuntimeError("All official national-data endpoints failed")
-            if source_name.endswith(".zip"):
-              z=zipfile.ZipFile(io.BytesIO(payload))
-              names=z.namelist(); receipt["zip_members"]=names
-              dats=[n for n in names if n.lower().endswith(".dat")]
-              if len(dats)!=1: raise ValueError(f"expected one DAT member, got {dats}")
-              raw=z.read(dats[0])
-              (OUT/"XXH2023_YRBS_Data.zip").write_bytes(payload)
-              receipt["files"].append({"file":"XXH2023_YRBS_Data.zip","url":source_url,"bytes":len(payload),"sha256":hashlib.sha256(payload).hexdigest()})
-            else:
-              raw=payload
-            (OUT/"XXH2023_YRBS_Data.dat").write_bytes(raw)
-            txt=raw.decode("utf-8-sig",errors="strict")
-            lines=[ln for ln in txt.splitlines() if ln.strip()]
-            if not (15000 <= len(lines) <= 25000): raise ValueError(f"unexpected row count {len(lines)}")
-            if not all(len(ln)>=100 for ln in lines[:100]): raise ValueError("short fixed-width row")
-            receipt["files"].append({"file":"XXH2023_YRBS_Data.dat","url":source_url,"bytes":len(raw),
-                                     "sha256":hashlib.sha256(raw).hexdigest(),"nonblank_lines":len(lines)})
-            req=urllib.request.Request(SPSS,headers={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
-                                                    "Accept":"*/*","Referer":INDEX})
-            with opener.open(req,timeout=120) as r: sps=r.read(500000)
-            st=sps.decode("utf-8-sig",errors="replace").upper()
-            if "DATA LIST" not in st or "VALUE LABELS" not in st: raise ValueError("invalid SPSS syntax")
-            (OUT/"2023XXH-SPSS.sps").write_bytes(sps)
-            receipt["files"].append({"file":"2023XXH-SPSS.sps","url":SPSS,"bytes":len(sps),"sha256":hashlib.sha256(sps).hexdigest()})
-            receipt["complete"]=True
+                  receipt["syntax_warning"]=f"{type(e).__name__}: {e}"
+              receipt["download_complete"]=True
           except Exception as e:
-            receipt["error"]=f"{type(e).__name__}: {e}"
+              receipt["error"]=f"{type(e).__name__}: {e}"
           (OUT/"source_receipt.json").write_text(json.dumps(receipt,indent=2),encoding="utf-8")
           print(json.dumps(receipt,indent=2),flush=True)
-          raise SystemExit(0 if receipt["complete"] else 1)
-      - name: Retain official source files and receipt
+          raise SystemExit(0 if receipt.get("download_complete") else 1)
+      - name: Install mdbtools and export all tables losslessly to CSV
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mdbtools
+          MDB=jss-yrbs-2023-official/XXH2023_YRBS_Data.mdb
+          mdb-tables -1 "$MDB" | sed '/^[[:space:]]*$/d' | tee jss-yrbs-2023-official/mdb_tables.txt
+          : > jss-yrbs-2023-official/mdb_export_log.txt
+          i=0
+          while IFS= read -r table; do
+            i=$((i+1))
+            safe=$(printf '%s' "$table" | tr -cs 'A-Za-z0-9._-' '_')
+            out="jss-yrbs-2023-official/table_$i-$safe.csv"
+            mdb-export "$MDB" "$table" > "$out"
+            rows=$(( $(wc -l < "$out") - 1 ))
+            printf '%s\t%s\t%s\n' "$table" "$rows" "$out" | tee -a jss-yrbs-2023-official/mdb_export_log.txt
+          done < jss-yrbs-2023-official/mdb_tables.txt
+      - name: Verify exported table and finalize receipt
+        if: success()
+        shell: python
+        run: |
+          from pathlib import Path
+          import csv,json,hashlib
+          OUT=Path("jss-yrbs-2023-official")
+          receipt=json.loads((OUT/"source_receipt.json").read_text())
+          csvs=list(OUT.glob("table_*.csv"))
+          infos=[]
+          for p in csvs:
+              with p.open("r",encoding="utf-8-sig",newline="") as f:
+                  r=csv.reader(f); header=next(r); rows=sum(1 for _ in r)
+              infos.append({"file":p.name,"rows":rows,"columns":len(header),"header":header,
+                            "bytes":p.stat().st_size,"sha256":hashlib.sha256(p.read_bytes()).hexdigest()})
+          receipt["exports"]=infos
+          candidates=[x for x in infos if 15000 <= x["rows"] <= 25000 and x["columns"] >= 50]
+          if len(candidates)!=1:
+              receipt["error"]=f"expected one national student table, found {len(candidates)} candidates"
+              (OUT/"source_receipt.json").write_text(json.dumps(receipt,indent=2),encoding="utf-8")
+              raise SystemExit(1)
+          receipt["selected_export"]=candidates[0]["file"]
+          receipt["complete"]=True
+          (OUT/"source_receipt.json").write_text(json.dumps(receipt,indent=2),encoding="utf-8")
+          print(json.dumps(receipt,indent=2))
+      - name: Retain official source files and exported table
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
