@@ -1,0 +1,131 @@
+name: JSS 2023 YRBS combined-source fallback
+on:
+  push:
+    branches: ["research/jss-2023-validation"]
+    paths: [".github/workflows/jss-yrbs-2023-combined.yml"]
+permissions: {}
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Retrieve official CDC combined-national archive through two official endpoints
+        shell: python
+        run: |
+          from pathlib import Path
+          from datetime import datetime, timezone
+          import urllib.request, urllib.error, hashlib, json, time, zipfile, io
+          OUT=Path("jss-yrbs-2023-combined"); OUT.mkdir()
+          INDEX="https://www.cdc.gov/yrbs/data/index.html"
+          URLS=[
+            "https://www.cdc.gov/yrbs/files/sadc_2023/HS/SADC_2023_National.zip",
+            "https://www.cdc.gov/yrbs/files/sadc_2023/HS/sadc_2023_national.dat",
+          ]
+          headers={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
+                   "Accept":"*/*","Referer":INDEX}
+          receipt={"retrieved_utc":datetime.now(timezone.utc).isoformat(),"authority":"U.S. CDC",
+                   "scope":"combined national high-school YRBS through 2023; analysis will select 2023 only",
+                   "attempts":[],"complete":False}
+          payload=None; chosen=None
+          for url in URLS:
+              try:
+                  req=urllib.request.Request(url,headers=headers)
+                  with urllib.request.urlopen(req,timeout=180) as r:
+                      data=r.read(120_000_001); final=r.geturl(); ctype=r.headers.get("Content-Type","")
+                  if not (1000 <= len(data) <= 120_000_000): raise ValueError(f"unexpected size {len(data)}")
+                  if b"<html" in data[:1000].lower(): raise ValueError("HTML instead of data")
+                  payload=data; chosen=url
+                  receipt["attempts"].append({"url":url,"status":"downloaded","final_url":final,
+                                               "content_type":ctype,"bytes":len(data),
+                                               "sha256":hashlib.sha256(data).hexdigest()})
+                  break
+              except Exception as e:
+                  receipt["attempts"].append({"url":url,"status":"failed","error":f"{type(e).__name__}: {e}"})
+                  time.sleep(1)
+          if payload is None:
+              receipt["error"]="all official combined endpoints failed"
+          else:
+              if chosen.lower().endswith(".zip"):
+                  (OUT/"SADC_2023_National.zip").write_bytes(payload)
+                  try:
+                      z=zipfile.ZipFile(io.BytesIO(payload))
+                      receipt["zip_members"]=z.namelist()
+                      for n in z.namelist():
+                          lower=n.lower()
+                          if lower.endswith((".mdb",".dat",".csv",".sav")):
+                              raw=z.read(n)
+                              outname=Path(n).name
+                              (OUT/outname).write_bytes(raw)
+                              receipt.setdefault("extracted",[]).append({
+                                "member":n,"file":outname,"bytes":len(raw),"sha256":hashlib.sha256(raw).hexdigest()
+                              })
+                  except Exception as e:
+                      receipt["error"]=f"Zip extraction failed: {type(e).__name__}: {e}"
+              else:
+                  (OUT/"sadc_2023_national.dat").write_bytes(payload)
+                  receipt["extracted"]=[{"file":"sadc_2023_national.dat","bytes":len(payload),
+                                         "sha256":hashlib.sha256(payload).hexdigest()}]
+              if receipt.get("extracted") and not receipt.get("error"):
+                  receipt["complete"]=True
+          (OUT/"source_receipt.json").write_text(json.dumps(receipt,indent=2),encoding="utf-8")
+          print(json.dumps(receipt,indent=2),flush=True)
+          raise SystemExit(0 if receipt["complete"] else 1)
+      - name: Export Access tables if archive contains MDB
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          mdbs=(jss-yrbs-2023-combined/*.mdb)
+          if (( ${#mdbs[@]} == 0 )); then
+            echo "No MDB present; data file retained as-is." | tee jss-yrbs-2023-combined/export_note.txt
+            exit 0
+          fi
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mdbtools
+          : > jss-yrbs-2023-combined/mdb_export_log.txt
+          idx=0
+          for MDB in "${mdbs[@]}"; do
+            while IFS= read -r table; do
+              [[ -z "$table" ]] && continue
+              idx=$((idx+1))
+              safe=$(printf '%s' "$table" | tr -cs 'A-Za-z0-9._-' '_')
+              out="jss-yrbs-2023-combined/table_$idx-$safe.csv"
+              mdb-export "$MDB" "$table" > "$out"
+              rows=$(( $(wc -l < "$out") - 1 ))
+              printf '%s\t%s\t%s\n' "$table" "$rows" "$out" | tee -a jss-yrbs-2023-combined/mdb_export_log.txt
+            done < <(mdb-tables -1 "$MDB")
+          done
+      - name: Inventory extracted/exported files
+        if: success()
+        shell: python
+        run: |
+          from pathlib import Path
+          import hashlib,json,csv
+          OUT=Path("jss-yrbs-2023-combined")
+          r=json.loads((OUT/"source_receipt.json").read_text())
+          inv=[]
+          for p in sorted(OUT.iterdir()):
+              if not p.is_file() or p.name=="source_receipt.json": continue
+              rec={"file":p.name,"bytes":p.stat().st_size,"sha256":hashlib.sha256(p.read_bytes()).hexdigest()}
+              if p.suffix.lower()==".csv":
+                  try:
+                      with p.open("r",encoding="utf-8-sig",newline="") as f:
+                          reader=csv.reader(f); header=next(reader); rows=sum(1 for _ in reader)
+                      rec.update(rows=rows,columns=len(header),header=header)
+                  except Exception as e:
+                      rec["csv_error"]=f"{type(e).__name__}: {e}"
+              inv.append(rec)
+          r["inventory"]=inv
+          r["complete"]=True
+          (OUT/"source_receipt.json").write_text(json.dumps(r,indent=2),encoding="utf-8")
+          print(json.dumps(r,indent=2))
+      - name: Retain official source and exports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jss-yrbs-2023-combined
+          path: jss-yrbs-2023-combined/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
