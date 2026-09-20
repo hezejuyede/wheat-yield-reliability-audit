@@ -14,63 +14,74 @@ jobs:
         run: |
           from pathlib import Path
           from datetime import datetime, timezone
-          import urllib.request, hashlib, json, re
-          OUT = Path("jss-yrbs-2023-official")
-          OUT.mkdir()
-          sources = [
-              ("XXH2023_YRBS_Data.dat", "https://www.cdc.gov/yrbs/files/2023/XXH2023_YRBS_Data.dat"),
-              ("2023XXH-SPSS.sps", "https://www.cdc.gov/yrbs/files/2023/2023XXH-SPSS.sps"),
+          import urllib.request, urllib.error, hashlib, json, zipfile, io, time
+          OUT = Path("jss-yrbs-2023-official"); OUT.mkdir()
+          INDEX="https://www.cdc.gov/yrbs/data/index.html"
+          CANDIDATES=[
+            ("XXH2023_YRBS_Data.zip","https://www.cdc.gov/yrbs/files/2023/XXH2023_YRBS_Data.zip"),
+            ("XXH2023_YRBS_Data.dat","https://www.cdc.gov/yrbs/files/2023/XXH2023_YRBS_Data.dat"),
           ]
-          receipt = {
-              "retrieved_utc": datetime.now(timezone.utc).isoformat(),
-              "source_authority": "U.S. Centers for Disease Control and Prevention (CDC)",
-              "scope": "2023 national YRBS only",
-              "purpose": "locked later-cycle validation for Journal of Sports Sciences research article",
-              "files": [],
-              "complete": False,
-          }
+          SPSS="https://www.cdc.gov/yrbs/media/files/2026/03/2023XXH-SPSS.sps"
+          receipt={"retrieved_utc":datetime.now(timezone.utc).isoformat(),"source_authority":"U.S. CDC",
+                   "scope":"2023 national YRBS only","purpose":"locked later-cycle validation for JSS research article",
+                   "attempts":[],"files":[],"complete":False}
+          opener=urllib.request.build_opener()
+          opener.addheaders=[("User-Agent","Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36"),
+                             ("Accept","text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+                             ("Accept-Language","en-US,en;q=0.9")]
           try:
-              for name, url in sources:
-                  req = urllib.request.Request(url, headers={"User-Agent":"Mozilla/5.0 public-data-reproducibility"})
-                  with urllib.request.urlopen(req, timeout=120) as r:
-                      data = r.read(30_000_001)
-                      final_url = r.geturl()
-                      ctype = r.headers.get("Content-Type","")
-                  if len(data) < 1000 or len(data) > 30_000_000:
-                      raise ValueError(f"Unexpected payload size for {name}: {len(data)}")
-                  if b"<html" in data[:1000].lower() or b"<!doctype html" in data[:1000].lower():
-                      raise ValueError(f"HTML returned for {name}")
-                  (OUT/name).write_bytes(data)
-                  rec = {
-                      "file": name,
-                      "url": url,
-                      "final_url": final_url,
-                      "bytes": len(data),
-                      "sha256": hashlib.sha256(data).hexdigest(),
-                      "content_type": ctype
-                  }
-                  if name.endswith(".dat"):
-                      txt = data.decode("utf-8-sig", errors="strict")
-                      lines = [ln for ln in txt.splitlines() if ln.strip()]
-                      if len(lines) < 15000:
-                          raise ValueError(f"Too few nonblank records: {len(lines)}")
-                      if not all(len(ln) >= 100 for ln in lines[:100]):
-                          raise ValueError("Unexpectedly short fixed-width records")
-                      rec["nonblank_lines"] = len(lines)
-                      rec["min_line_length_first100"] = min(map(len, lines[:100]))
-                  else:
-                      txt = data.decode("utf-8-sig", errors="replace")
-                      upper = txt.upper()
-                      if "DATA LIST" not in upper or "VALUE LABELS" not in upper:
-                          raise ValueError("SPSS input program lacks expected DATA LIST / VALUE LABELS sections")
-                      rec["contains_data_list"] = True
-                      rec["contains_value_labels"] = True
-                  receipt["files"].append(rec)
-              receipt["complete"] = True
+            try:
+              with opener.open(INDEX,timeout=60) as r:
+                page=r.read(400000)
+              receipt["index_status"]="retrieved"
+              receipt["index_sha256"]=hashlib.sha256(page).hexdigest()
+            except Exception as e:
+              receipt["index_status"]=f"{type(e).__name__}: {e}"
+            payload=None; source_name=None; source_url=None
+            for name,url in CANDIDATES:
+              try:
+                req=urllib.request.Request(url,headers={
+                  "User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
+                  "Accept":"*/*","Referer":INDEX,"Sec-Fetch-Site":"same-origin","Sec-Fetch-Mode":"navigate"})
+                with opener.open(req,timeout=120) as r:
+                  data=r.read(30_000_001); final_url=r.geturl(); ctype=r.headers.get("Content-Type","")
+                receipt["attempts"].append({"url":url,"status":"downloaded","bytes":len(data),"content_type":ctype,"final_url":final_url})
+                if len(data)<1000 or len(data)>30_000_000: raise ValueError("unexpected payload size")
+                if b"<html" in data[:1000].lower(): raise ValueError("HTML instead of data")
+                payload=data; source_name=name; source_url=url; break
+              except Exception as e:
+                receipt["attempts"].append({"url":url,"status":"failed","error":f"{type(e).__name__}: {e}"})
+                time.sleep(1)
+            if payload is None: raise RuntimeError("All official national-data endpoints failed")
+            if source_name.endswith(".zip"):
+              z=zipfile.ZipFile(io.BytesIO(payload))
+              names=z.namelist(); receipt["zip_members"]=names
+              dats=[n for n in names if n.lower().endswith(".dat")]
+              if len(dats)!=1: raise ValueError(f"expected one DAT member, got {dats}")
+              raw=z.read(dats[0])
+              (OUT/"XXH2023_YRBS_Data.zip").write_bytes(payload)
+              receipt["files"].append({"file":"XXH2023_YRBS_Data.zip","url":source_url,"bytes":len(payload),"sha256":hashlib.sha256(payload).hexdigest()})
+            else:
+              raw=payload
+            (OUT/"XXH2023_YRBS_Data.dat").write_bytes(raw)
+            txt=raw.decode("utf-8-sig",errors="strict")
+            lines=[ln for ln in txt.splitlines() if ln.strip()]
+            if not (15000 <= len(lines) <= 25000): raise ValueError(f"unexpected row count {len(lines)}")
+            if not all(len(ln)>=100 for ln in lines[:100]): raise ValueError("short fixed-width row")
+            receipt["files"].append({"file":"XXH2023_YRBS_Data.dat","url":source_url,"bytes":len(raw),
+                                     "sha256":hashlib.sha256(raw).hexdigest(),"nonblank_lines":len(lines)})
+            req=urllib.request.Request(SPSS,headers={"User-Agent":"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/136 Safari/537.36",
+                                                    "Accept":"*/*","Referer":INDEX})
+            with opener.open(req,timeout=120) as r: sps=r.read(500000)
+            st=sps.decode("utf-8-sig",errors="replace").upper()
+            if "DATA LIST" not in st or "VALUE LABELS" not in st: raise ValueError("invalid SPSS syntax")
+            (OUT/"2023XXH-SPSS.sps").write_bytes(sps)
+            receipt["files"].append({"file":"2023XXH-SPSS.sps","url":SPSS,"bytes":len(sps),"sha256":hashlib.sha256(sps).hexdigest()})
+            receipt["complete"]=True
           except Exception as e:
-              receipt["error"] = f"{type(e).__name__}: {e}"
-          (OUT/"source_receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
-          print(json.dumps(receipt, indent=2), flush=True)
+            receipt["error"]=f"{type(e).__name__}: {e}"
+          (OUT/"source_receipt.json").write_text(json.dumps(receipt,indent=2),encoding="utf-8")
+          print(json.dumps(receipt,indent=2),flush=True)
           raise SystemExit(0 if receipt["complete"] else 1)
       - name: Retain official source files and receipt
         if: always()
