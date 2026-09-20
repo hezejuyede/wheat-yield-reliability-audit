@@ -1,0 +1,116 @@
+name: JSS 2023 YRBS browser retrieval
+on:
+  push:
+    branches: ["research/jss-2023-validation"]
+    paths: [".github/workflows/jss-yrbs-2023-browser.yml"]
+permissions: {}
+jobs:
+  retrieve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Install Playwright
+        run: |
+          python -m pip install -q playwright
+          python -m playwright install --with-deps chromium
+      - name: Retrieve official CDC 2023 national Access archive in browser context
+        shell: python
+        run: |
+          from pathlib import Path
+          from datetime import datetime, timezone
+          from playwright.sync_api import sync_playwright
+          import hashlib,json,zipfile,io,time
+          OUT=Path("jss-yrbs-2023-browser"); OUT.mkdir()
+          index="https://www.cdc.gov/yrbs/data/national-yrbs-datasets-documentation.html"
+          target="https://www.cdc.gov/yrbs/files/2023/XXH2023_YRBS_Data.zip"
+          receipt={"retrieved_utc":datetime.now(timezone.utc).isoformat(),"authority":"U.S. CDC",
+                   "index":index,"target":target,"method":"Chromium browser context","complete":False}
+          try:
+              with sync_playwright() as p:
+                  browser=p.chromium.launch(headless=True)
+                  context=browser.new_context(
+                      user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/136.0.0.0 Safari/537.36",
+                      accept_downloads=True)
+                  page=context.new_page()
+                  resp=page.goto(index,wait_until="domcontentloaded",timeout=90000)
+                  receipt["index_status"]=resp.status if resp else None
+                  page.wait_for_timeout(3000)
+                  # Use the same browser context request so CDC cookies/session carry over.
+                  api=context.request
+                  r=api.get(target,headers={"Referer":index},timeout=120000)
+                  receipt["download_status"]=r.status
+                  receipt["content_type"]=r.headers.get("content-type")
+                  if not r.ok:
+                      raise RuntimeError(f"CDC returned HTTP {r.status}")
+                  data=r.body()
+                  if not (1_000_000 <= len(data) <= 10_000_000):
+                      raise ValueError(f"unexpected size {len(data)}")
+                  if data[:2] != b"PK":
+                      raise ValueError("download is not ZIP")
+                  (OUT/"XXH2023_YRBS_Data.zip").write_bytes(data)
+                  z=zipfile.ZipFile(io.BytesIO(data))
+                  names=z.namelist(); receipt["zip_members"]=names
+                  mdbs=[n for n in names if n.lower().endswith(".mdb")]
+                  if len(mdbs)!=1: raise ValueError(f"expected one MDB, found {mdbs}")
+                  mdb=z.read(mdbs[0]); (OUT/"XXH2023_YRBS_Data.mdb").write_bytes(mdb)
+                  receipt["zip_bytes"]=len(data); receipt["zip_sha256"]=hashlib.sha256(data).hexdigest()
+                  receipt["mdb_bytes"]=len(mdb); receipt["mdb_sha256"]=hashlib.sha256(mdb).hexdigest()
+                  receipt["complete"]=True
+                  browser.close()
+          except Exception as e:
+              receipt["error"]=f"{type(e).__name__}: {e}"
+          (OUT/"source_receipt.json").write_text(json.dumps(receipt,indent=2),encoding="utf-8")
+          print(json.dumps(receipt,indent=2),flush=True)
+          raise SystemExit(0 if receipt["complete"] else 1)
+      - name: Export Access tables
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq mdbtools
+          MDB=jss-yrbs-2023-browser/XXH2023_YRBS_Data.mdb
+          mdb-tables -1 "$MDB" | sed '/^[[:space:]]*$/d' | tee jss-yrbs-2023-browser/mdb_tables.txt
+          : > jss-yrbs-2023-browser/mdb_export_log.txt
+          idx=0
+          while IFS= read -r table; do
+            [[ -z "$table" ]] && continue
+            idx=$((idx+1))
+            safe=$(printf '%s' "$table" | tr -cs 'A-Za-z0-9._-' '_')
+            out="jss-yrbs-2023-browser/table_$idx-$safe.csv"
+            mdb-export "$MDB" "$table" > "$out"
+            rows=$(( $(wc -l < "$out") - 1 ))
+            printf '%s\t%s\t%s\n' "$table" "$rows" "$out" | tee -a jss-yrbs-2023-browser/mdb_export_log.txt
+          done < jss-yrbs-2023-browser/mdb_tables.txt
+      - name: Final inventory
+        if: success()
+        shell: python
+        run: |
+          from pathlib import Path
+          import csv,json,hashlib
+          OUT=Path("jss-yrbs-2023-browser")
+          r=json.loads((OUT/"source_receipt.json").read_text())
+          exports=[]
+          for p in sorted(OUT.glob("table_*.csv")):
+              with p.open("r",encoding="utf-8-sig",newline="") as f:
+                  rd=csv.reader(f); header=next(rd); rows=sum(1 for _ in rd)
+              exports.append({"file":p.name,"rows":rows,"columns":len(header),"header":header,
+                              "bytes":p.stat().st_size,"sha256":hashlib.sha256(p.read_bytes()).hexdigest()})
+          r["exports"]=exports
+          candidates=[x for x in exports if 15000 <= x["rows"] <= 25000 and x["columns"]>=50]
+          if len(candidates)!=1:
+              r["complete"]=False; r["error"]=f"expected one student table candidate, found {len(candidates)}"
+          else:
+              r["selected_export"]=candidates[0]["file"]; r["complete"]=True
+          (OUT/"source_receipt.json").write_text(json.dumps(r,indent=2),encoding="utf-8")
+          print(json.dumps(r,indent=2))
+          raise SystemExit(0 if r["complete"] else 1)
+      - name: Retain official source and export
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: jss-yrbs-2023-browser
+          path: jss-yrbs-2023-browser/
+          retention-days: 1
+          compression-level: 6
+          if-no-files-found: error
